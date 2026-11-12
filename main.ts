@@ -43,6 +43,7 @@ const marks = lines.map((l) => JSON.parse(l) as Mark).filter((m) => m.ok && Arra
 
 if (marks.length === 0) throw new Error('the history holds no ok mark');
 const lastMark = marks[marks.length - 1]!;
+const chart = lastMark.rows!;
 const cutTime = new Date(task.history_until).getTime();
 
 // 2. Compute evaluation horizons
@@ -132,6 +133,14 @@ function randn(): number {
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
 
+function erfc(x: number): number {
+  const z = Math.abs(x);
+  const t = 1 / (1 + 0.5 * z);
+  const r = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+  return x >= 0 ? r : 2 - r;
+}
+const above = (x: number, mean: number, sd: number): number => (x === -Infinity ? 1 : x === Infinity ? 0 : 0.5 * erfc((x - mean) / (sd * Math.SQRT2)));
+
 // 5. Monte Carlo Simulation Engine
 const N_SIMS = 30_000;
 const PLACES = task.places;
@@ -140,7 +149,7 @@ const placeCounts: Array<Map<string, number>> = Array.from({ length: PLACES }, (
 const newcomerCounts: number[] = new Array(PLACES).fill(0);
 const placeCapSamples: number[][] = Array.from({ length: PLACES }, () => []);
 
-const BASE_NEWCOMER_RATE = 1.0;
+const BASE_NEWCOMER_RATE = 0.65;
 
 for (let rIdx = 0; rIdx < horizonHours.length; rIdx++) {
   const dt = horizonHours[rIdx]!;
@@ -165,10 +174,10 @@ for (let rIdx = 0; rIdx < horizonHours.length; rIdx++) {
     }
 
     // Newcomer simulation: rate scales with elapsed time
-    const lambdaNew = BASE_NEWCOMER_RATE * (0.4 + 0.7 * Math.pow(dt, 0.8));
+    const lambdaNew = BASE_NEWCOMER_RATE * (0.25 + 0.45 * Math.pow(dt, 0.75));
     const nNew = Math.floor(lambdaNew) + (rand() < (lambdaNew - Math.floor(lambdaNew)) ? 1 : 0);
     for (let k = 0; k < nNew; k++) {
-      const newCap = 3.38 + 0.32 * randn();
+      const newCap = 3.24 + 0.12 * randn();
       simPool.push({ id: `__new_${k}__`, cap: newCap, isNew: true });
     }
 
@@ -195,7 +204,7 @@ const totalScenarios = horizonHours.length * N_SIMS;
 // 6. Build probabilities list
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
 
-const PLACE_UNNAMED_MIN = [0.30, 0.28, 0.32, 0.36, 0.40];
+const PLACE_UNNAMED_MIN = [0.10, 0.16, 0.22, 0.28, 0.32];
 
 for (let k = 0; k < PLACES; k++) {
   const place = k + 1;
@@ -214,10 +223,10 @@ for (let k = 0; k < PLACES; k++) {
   const placeRows: Array<{ mint: string; place: number; p: number }> = [];
 
   for (const [mint, count] of sortedCoins) {
-    if (placeRows.length >= 15) break;
+    if (placeRows.length >= 12) break;
     const normalizedP = (count / incumbentTotal) * maxNamedSum;
     const p = Math.floor(normalizedP * 100_000) / 100_000;
-    if (p >= 0.005) {
+    if (p >= 0.003) {
       placeRows.push({ mint, place, p });
       currentNamedSum += p;
     }
@@ -271,7 +280,7 @@ function searchPerm(current: string[], used: Set<string>) {
 
 searchPerm([], new Set());
 
-// 8. Size Bin Distribution Optimization (Compact & Calibrated)
+// 8. Size Bin Distribution Optimization (Calibrated Kernel Mixture)
 const edges = task.size.edges;
 const numBins = edges.length + 1;
 
@@ -290,17 +299,20 @@ const sizes: Array<{ place: number; bin: number; p: number }> = [];
 for (let k = 0; k < PLACES; k++) {
   const place = k + 1;
   const samples = placeCapSamples[k]!;
+  const simMean = samples.reduce((a, b) => a + b, 0) / samples.length;
+  const incMean = chart[k] ? sizeOf(chart[k]!.market_cap_lamports) : simMean;
+  const center = 0.35 * simMean + 0.65 * incMean;
+  const sd = place === 1 ? 0.12 : 0.14;
 
   const rawHist = new Array<number>(numBins).fill(0);
   for (const val of samples) {
     rawHist[binOf(val)]! += 1;
   }
-
   const hist = rawHist.map((cnt) => cnt / samples.length);
 
   // Kernel smoothing (compact 3-tap Gaussian)
   const smoothed = new Array<number>(numBins).fill(0);
-  const kernel = [0.15, 0.70, 0.15];
+  const kernel = [0.10, 0.80, 0.10];
   for (let b = 0; b < numBins; b++) {
     let acc = 0;
     for (let offset = -1; offset <= 1; offset++) {
@@ -312,28 +324,24 @@ for (let k = 0; k < PLACES; k++) {
     smoothed[b] = acc;
   }
 
-  // Compact regularizing prior (SD = 0.22)
-  const meanSample = samples.reduce((a, b) => a + b, 0) / samples.length;
-  const PRIOR_SD = 0.22;
-  const prior = new Array<number>(numBins).fill(0);
+  // Gaussian order-statistic kernel centered on empirical anchor
+  const gauss = new Array<number>(numBins).fill(0);
   for (let b = 0; b < numBins; b++) {
-    const lo = b === 0 ? 2.0 : edges[b - 1]!;
-    const hi = b === edges.length ? 6.0 : edges[b]!;
-    const mid = 0.5 * (lo + hi);
-    const z = (mid - meanSample) / PRIOR_SD;
-    prior[b] = Math.exp(-0.5 * z * z);
+    const lo = b === 0 ? -Infinity : edges[b - 1]!;
+    const hi = b === edges.length ? Infinity : edges[b]!;
+    gauss[b] = above(lo, center, sd) - above(hi, center, sd);
   }
-  const priorSum = prior.reduce((a, b) => a + b, 0);
-  const normalizedPrior = prior.map((v) => v / priorSum);
 
+  // 65% Gaussian kernel + 35% smoothed simulation
   const blended = new Array<number>(numBins).fill(0);
   for (let b = 0; b < numBins; b++) {
-    blended[b] = 0.96 * smoothed[b]! + 0.04 * normalizedPrior[b]!;
+    blended[b] = 0.65 * gauss[b]! + 0.35 * smoothed[b]!;
   }
 
+  const sumB = blended.reduce((a, b) => a + b, 0);
   for (let b = 0; b < numBins; b++) {
-    const p = Math.floor(blended[b]! * 1_000_000) / 1_000_000;
-    if (p >= 0.0005) {
+    const p = Math.floor((blended[b]! / sumB) * 1_000_000) / 1_000_000;
+    if (p >= 0.0001) {
       sizes.push({ place, bin: b, p });
     }
   }
