@@ -1,4 +1,4 @@
-// pumpfun-top5-forecast-01: Calibrated probabilistic forecaster v2
+// pumpfun-top5-forecast-01: Calibrated probabilistic forecaster v3
 // Multi-horizon Monte Carlo simulation with reserve-weighted hazard dynamics, momentum, and newcomer fields.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -140,6 +140,8 @@ const placeCounts: Array<Map<string, number>> = Array.from({ length: PLACES }, (
 const newcomerCounts: number[] = new Array(PLACES).fill(0);
 const placeCapSamples: number[][] = Array.from({ length: PLACES }, () => []);
 
+const BASE_NEWCOMER_RATE = 1.0;
+
 for (let rIdx = 0; rIdx < horizonHours.length; rIdx++) {
   const dt = horizonHours[rIdx]!;
   const sqrtDt = Math.sqrt(Math.max(0.1, dt));
@@ -151,22 +153,22 @@ for (let rIdx = 0; rIdx < horizonHours.length; rIdx++) {
     for (const c of candidates) {
       const reserveFactor = Math.min(1.0, c.reservesSol / 200);
       const hazard = Math.max(0.06, 0.20 - 0.06 * (c.logCap - 3.0) - 0.04 * reserveFactor - 0.03 * Math.min(1.0, c.ageHours));
-      const crashProb = 1 - Math.exp(-hazard * Math.max(0.1, dt));
+      const crashProb = 1 - Math.exp(-hazard * Math.max(0.08, dt));
 
       if (rand() < crashProb) {
         simPool.push({ id: c.mint, cap: 1.55 + 0.12 * randn(), isNew: false });
       } else {
+        const vol = 0.24 * Math.max(0.35, sqrtDt);
         const drift = -0.04 * dt + 0.10 * c.velocity * Math.min(1.0, dt);
-        const diff = 0.22 * sqrtDt * randn();
-        simPool.push({ id: c.mint, cap: c.logCap + drift + diff, isNew: false });
+        simPool.push({ id: c.mint, cap: c.logCap + drift + vol * randn(), isNew: false });
       }
     }
 
     // Newcomer simulation: rate scales with elapsed time
-    const lambdaNew = 0.5 + 0.6 * dt;
+    const lambdaNew = BASE_NEWCOMER_RATE * (0.4 + 0.7 * Math.pow(dt, 0.8));
     const nNew = Math.floor(lambdaNew) + (rand() < (lambdaNew - Math.floor(lambdaNew)) ? 1 : 0);
     for (let k = 0; k < nNew; k++) {
-      const newCap = 3.35 + 0.35 * randn();
+      const newCap = 3.38 + 0.32 * randn();
       simPool.push({ id: `__new_${k}__`, cap: newCap, isNew: true });
     }
 
@@ -193,13 +195,16 @@ const totalScenarios = horizonHours.length * N_SIMS;
 // 6. Build probabilities list
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
 
+const PLACE_UNNAMED_MIN = [0.30, 0.28, 0.32, 0.36, 0.40];
+
 for (let k = 0; k < PLACES; k++) {
   const place = k + 1;
   const m = placeCounts[k]!;
   const newCount = newcomerCounts[k]!;
   const empiricalNewcomerProb = newCount / totalScenarios;
 
-  const targetUnnamed = Math.min(0.65, Math.max(0.25, empiricalNewcomerProb + 0.05));
+  const minUnnamed = PLACE_UNNAMED_MIN[k]!;
+  const targetUnnamed = Math.min(0.65, Math.max(minUnnamed, empiricalNewcomerProb + 0.04));
   const maxNamedSum = 1.0 - targetUnnamed;
 
   const sortedCoins = Array.from(m.entries()).sort((a, b) => b[1] - a[1]);
@@ -266,7 +271,7 @@ function searchPerm(current: string[], used: Set<string>) {
 
 searchPerm([], new Set());
 
-// 8. Size Bin Distribution Optimization
+// 8. Size Bin Distribution Optimization (Compact & Calibrated)
 const edges = task.size.edges;
 const numBins = edges.length + 1;
 
@@ -293,23 +298,23 @@ for (let k = 0; k < PLACES; k++) {
 
   const hist = rawHist.map((cnt) => cnt / samples.length);
 
-  // Kernel smoothing (5-tap Gaussian)
+  // Kernel smoothing (compact 3-tap Gaussian)
   const smoothed = new Array<number>(numBins).fill(0);
-  const kernel = [0.06, 0.24, 0.40, 0.24, 0.06];
+  const kernel = [0.15, 0.70, 0.15];
   for (let b = 0; b < numBins; b++) {
     let acc = 0;
-    for (let offset = -2; offset <= 2; offset++) {
+    for (let offset = -1; offset <= 1; offset++) {
       const idx = b + offset;
       if (idx >= 0 && idx < numBins) {
-        acc += hist[idx]! * kernel[offset + 2]!;
+        acc += hist[idx]! * kernel[offset + 1]!;
       }
     }
     smoothed[b] = acc;
   }
 
-  // Broad regularizing prior around mean
+  // Compact regularizing prior (SD = 0.22)
   const meanSample = samples.reduce((a, b) => a + b, 0) / samples.length;
-  const PRIOR_SD = 0.45;
+  const PRIOR_SD = 0.22;
   const prior = new Array<number>(numBins).fill(0);
   for (let b = 0; b < numBins; b++) {
     const lo = b === 0 ? 2.0 : edges[b - 1]!;
@@ -323,12 +328,12 @@ for (let k = 0; k < PLACES; k++) {
 
   const blended = new Array<number>(numBins).fill(0);
   for (let b = 0; b < numBins; b++) {
-    blended[b] = 0.92 * smoothed[b]! + 0.08 * normalizedPrior[b]!;
+    blended[b] = 0.96 * smoothed[b]! + 0.04 * normalizedPrior[b]!;
   }
 
   for (let b = 0; b < numBins; b++) {
     const p = Math.floor(blended[b]! * 1_000_000) / 1_000_000;
-    if (p >= 0.0001) {
+    if (p >= 0.0005) {
       sizes.push({ place, bin: b, p });
     }
   }
@@ -336,4 +341,3 @@ for (let k = 0; k < PLACES; k++) {
 
 // 9. Write forecast.json
 writeFileSync(join(OUTPUT_DIR, task.output), `${JSON.stringify({ probabilities, top5: bestTop5, sizes })}\n`);
-
